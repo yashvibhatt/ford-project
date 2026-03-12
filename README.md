@@ -1,3 +1,6 @@
+![R](https://img.shields.io/badge/language-R-blue)
+![Finance](https://img.shields.io/badge/domain-Quantitative%20Finance-green)
+
 # Macroeconomic Factor Modeling of Ford Motor Company Stock Returns
 
 ---
