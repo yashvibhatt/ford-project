@@ -1,8 +1,4 @@
-# FIN503 Final Project: Predicting Ford Motor Company Stock Returns
-
-**Authors:** Vincent Ngai and Yashvi Bhatt
-**Course:** FIN 503
-**Date:** December 2025
+# Macroeconomic Factor Modeling of Ford Motor Company Stock Returns
 
 ---
 
