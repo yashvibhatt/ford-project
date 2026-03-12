@@ -1,0 +1,5 @@
+.DS_Store
+*.knit.md
+*.utf8.md
+*_cache/
+*_files/

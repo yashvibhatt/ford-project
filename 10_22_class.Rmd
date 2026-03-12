@@ -1,0 +1,601 @@
+---
+title: "FIN503 Final Project: Predicting Ford Motor Company Stock Returns Using Multi-Factor Regression"
+subtitle: "Variable Selection, Diagnostic Testing, and Out-of-Sample Evaluation"
+author: "Vincent Ngai and Yashvi Bhatt"
+date: "2025-12-07"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 8,
+  fig.height = 5
+)
+```
+
+```{r packages}
+# ── Package Loading ────────────────────────────────────────────────────────────
+library(dplyr)      # Data manipulation
+library(MASS)       # Stepwise AIC (stepAIC)
+library(leaps)      # Best-subset selection (Mallows' Cp)
+library(car)        # VIF, qqPlot
+library(lmtest)     # Breusch-Pagan heteroskedasticity test
+library(estimatr)   # Heteroskedasticity-consistent (robust) standard errors
+library(ggplot2)    # Plotting
+library(knitr)      # Table formatting
+library(kableExtra) # Enhanced HTML tables
+library(corrplot)   # Correlation heatmap
+```
+
+---
+
+# Introduction
+
+This project investigates whether the monthly stock returns of **Ford Motor Company** can be systematically predicted using a combination of macroeconomic indicators, market-level variables, and commodity prices. Using monthly data spanning January 2004 through November 2025, we build and compare several linear regression models, apply formal model-selection criteria, conduct regression diagnostics, and evaluate out-of-sample forecasting performance on a 23-month holdout period (January 2024 – November 2025).
+
+The central research question is: **Which subset of macroeconomic and market predictors best explains Ford's monthly stock returns, and how well does the chosen model perform on unseen data?**
+
+Our analysis proceeds as follows: (1) data loading and feature engineering; (2) exploratory analysis; (3) full-model estimation; (4) variable selection via stepwise AIC and Mallows' Cp; (5) regression diagnostics including multicollinearity (VIF), normality of residuals (Shapiro-Wilk), and heteroskedasticity (Breusch-Pagan); (6) robust standard errors; and (7) out-of-sample prediction with RMSE, MAE, and OOS R² metrics.
+
+---
+
+# Data Loading
+
+The raw dataset contains 263 monthly observations from January 2004 through November 2025.
+
+```{r load-data}
+df <- read.csv("FIN503_project_data.csv")
+cat("Dimensions:", nrow(df), "rows ×", ncol(df), "columns\n")
+cat("Variables:", paste(names(df), collapse = ", "), "\n")
+```
+
+**Variable Descriptions:**
+
+| Raw Variable | Description |
+|---|---|
+| `S.and.P` | S&P 500 Index level |
+| `Ford` | Ford Motor Company stock price |
+| `gold` | Gold spot price (USD/oz) |
+| `oil` | Crude oil price (USD/bbl) |
+| `usd_euro_ex` | USD/EUR exchange rate |
+| `FIBOR` | Frankfurt Interbank Offered Rate |
+| `Confidence.Index` | Barron's Confidence Index |
+| `market_p_to_b` | S&P 500 Price-to-Book ratio |
+| `div_yield` | S&P 500 dividend yield (%) |
+| `market_eps` | S&P 500 earnings per share |
+| `Volatility` | S&P 500 implied volatility (VIX, %) |
+| `X10y_treasury` | 10-Year US Treasury yield (%) |
+| `R_f` | Risk-free rate (%) |
+
+---
+
+# Feature Engineering
+
+We transform the raw price and rate data into economically meaningful predictors. Asset prices become monthly returns, percentage yields are converted to decimal form, and valuation ratios are derived from their reciprocals. The first observation is dropped from the training set because lag-based return calculations are undefined for the initial row.
+
+```{r feature-engineering}
+df <- df %>%
+  mutate(
+    # Valuation ratios
+    div_to_price      = div_yield / 100,
+    earnings_to_price = market_eps / S.and.P,
+    book_to_market    = 1 / market_p_to_b,
+
+    # Monthly asset returns (price relative minus 1)
+    gold_return   = (gold        / lag(gold))        - 1,
+    oil_return    = (oil         / lag(oil))          - 1,
+    dol_eu_change = (usd_euro_ex / lag(usd_euro_ex)) - 1,
+    ford_return   = (Ford        / lag(Ford))         - 1,
+    market_return = (S.and.P     / lag(S.and.P))      - 1,
+
+    # Market risk premium and realized variance
+    excess_return   = market_return - R_f / 100,
+    market_variance = (Volatility / 100)^2,
+
+    # Interest rates converted to decimal form
+    X10y_treasury = X10y_treasury / 100,
+    FIBOR         = FIBOR         / 100
+  ) %>%
+  dplyr::select(
+    Date, FIBOR, Confidence.Index, X10y_treasury, div_to_price,
+    earnings_to_price, book_to_market, gold_return, oil_return,
+    dol_eu_change, ford_return, excess_return, market_variance
+  )
+```
+
+## Train / Test Split {-}
+
+We use a **time-series aware split** that respects the chronological ordering of observations. The training set covers February 2004 through December 2023 (239 months), and the holdout set covers January 2024 through November 2025 (23 months). This design prevents look-ahead bias: all model parameters are estimated exclusively on past data, and performance is evaluated on a genuinely unseen future period.
+
+```{r train-test-split}
+training_df <- df[2:240, ]   # In-sample:  Feb 2004 – Dec 2023 (239 obs)
+predict_df  <- df[241:263, ] # Out-of-sample: Jan 2024 – Nov 2025 (23 obs)
+
+cat("Training observations:", nrow(training_df), "\n")
+cat("Holdout  observations:", nrow(predict_df),  "\n")
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Summary Statistics
+
+```{r summary-stats}
+training_df %>%
+  dplyr::select(-Date) %>%
+  summary()
+```
+
+## Correlation Heatmap
+
+Before building models, we examine pairwise correlations across all variables to identify potential multicollinearity and relationships with the target variable (`ford_return`).
+
+```{r correlation-heatmap, fig.width = 9, fig.height = 8}
+cor_mat <- training_df %>%
+  dplyr::select(-Date) %>%
+  cor(use = "complete.obs")
+
+corrplot(
+  cor_mat,
+  method      = "color",
+  type        = "upper",
+  tl.cex      = 0.75,
+  addCoef.col = "black",
+  number.cex  = 0.52,
+  title       = "Correlation Matrix — Training Period Variables",
+  mar         = c(0, 0, 2, 0)
+)
+```
+
+*The heatmap reveals a notable positive correlation between `div_to_price` and `X10y_treasury`, and a moderate positive correlation between `excess_return` and `market_variance`. These relationships will be formally assessed through VIF analysis in Section 6.*
+
+---
+
+# Model Building
+
+## Full Model (Kitchen Sink)
+
+We begin by regressing Ford's monthly return on all 11 candidate predictors. This full model serves as a baseline and provides the input required for the variable-selection algorithms below.
+
+```{r full-model}
+big_reg <- lm(
+  ford_return ~ FIBOR + Confidence.Index + X10y_treasury + div_to_price +
+    earnings_to_price + book_to_market + gold_return + oil_return +
+    dol_eu_change + excess_return + market_variance,
+  data = training_df
+)
+summary(big_reg)
+```
+
+The full model explains a substantial share of in-sample variation, but several predictors are not individually significant — motivating the use of formal variable selection.
+
+## Variable Selection: Stepwise AIC
+
+Stepwise regression using the **Akaike Information Criterion (AIC)** iteratively adds and removes predictors, retaining only those that improve the penalized log-likelihood. Lower AIC indicates a better balance between fit and model complexity.
+
+```{r stepaic, results = 'hide'}
+# Run stepwise AIC (both directions); suppress per-step output
+step_result <- stepAIC(big_reg, direction = "both", trace = FALSE)
+```
+
+```{r stepaic-summary}
+summary(step_result)
+```
+
+The stepwise AIC algorithm selects a **4-variable model**:
+
+$$\hat{R}^{Ford}_t = \beta_0 + \beta_1 \cdot \text{DivYield}_t + \beta_2 \cdot \text{MktVar}_t + \beta_3 \cdot \text{10yYield}_t + \beta_4 \cdot \text{ExcessReturn}_t + \varepsilon_t$$
+
+```{r aic-model}
+AIC_reg <- lm(
+  ford_return ~ div_to_price + market_variance + X10y_treasury + excess_return,
+  data = training_df
+)
+summary(AIC_reg)
+```
+
+## Variable Selection: Mallows' Cp
+
+**Mallows' Cp** is a bias-variance tradeoff criterion. For each candidate model of size $p$, we prefer specifications where $C_p \approx p + 1$ (intercept included). Models with $C_p$ substantially above $p + 1$ suffer from omitted-variable bias; those well below may be overfitted.
+
+```{r mallows-cp}
+# Remove ford_return (col 11) and Date (col 1) to form the predictor matrix
+temp    <- training_df[, -11]
+temp    <- temp[, -1]
+x       <- as.matrix(temp)
+names_x <- c("FIBOR", "Conf", "10y", "div", "ep", "bm",
+              "goldr", "oilr", "ex", "ret", "var")
+
+leaps.fit <- leaps(
+  y     = training_df$ford_return,
+  x     = x,
+  names = names_x,
+  nbest = 1
+)
+
+# Build and display Cp table
+cp_table <- cbind(as.data.frame(leaps.fit$which), Cp = round(leaps.fit$Cp, 2))
+kable(cp_table,
+      caption = "Mallows' Cp by Model Size — Best Model per Size Class") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE,
+                font_size = 12)
+```
+
+The Cp criterion selects the **3-variable model** containing FIBOR, dividend-to-price ratio, and excess market return — the point at which Cp is closest to $p + 1 = 4$.
+
+```{r cp-model}
+CP_reg <- lm(ford_return ~ FIBOR + div_to_price + excess_return,
+             data = training_df)
+summary(CP_reg)
+```
+
+## CAPM Benchmark
+
+As an academic benchmark, we estimate the single-factor **Capital Asset Pricing Model (CAPM)**. Under CAPM, a stock's return in excess of the risk-free rate is determined solely by its market beta — its sensitivity to the market risk premium. The intercept (Jensen's alpha) is constrained to zero.
+
+```{r capm}
+CAPM <- lm(ford_return ~ 0 + excess_return, data = training_df)
+summary(CAPM)
+```
+
+## In-Sample Model Comparison
+
+Both selection criteria agree that the **market excess return**, **dividend-to-price ratio**, and several macroeconomic rate variables are relevant predictors, but they disagree on the precise set. We compare the two candidate models on Adjusted R² and AIC:
+
+```{r insample-comparison}
+insample_tbl <- data.frame(
+  Model        = c("Full (11 vars)", "AIC-Selected (4 vars)",
+                   "Cp-Selected (3 vars)", "CAPM (1 var)"),
+  Adj_R2       = round(c(summary(big_reg)$adj.r.squared,
+                          summary(AIC_reg)$adj.r.squared,
+                          summary(CP_reg)$adj.r.squared,
+                          summary(CAPM)$adj.r.squared), 4),
+  AIC_val      = round(c(AIC(big_reg), AIC(AIC_reg),
+                          AIC(CP_reg),  AIC(CAPM)), 2)
+)
+
+kable(insample_tbl,
+      col.names = c("Model", "Adj. R²", "AIC"),
+      caption   = "In-Sample Model Comparison") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  row_spec(2, bold = TRUE, background = "#d4edda")
+```
+
+The AIC-selected 4-variable model achieves an Adjusted R² of `r round(summary(AIC_reg)$adj.r.squared, 4)`, modestly outperforming the Cp-selected model (`r round(summary(CP_reg)$adj.r.squared, 4)`). Because the two selection criteria diverge, we break the tie using Adjusted R² and proceed with the **4-variable AIC model** as our primary specification.
+
+---
+
+# Regression Diagnostics
+
+## Multicollinearity
+
+We first examine pairwise scatter plots and the correlation matrix of the four selected predictors, then formally test for multicollinearity using **Variance Inflation Factors (VIF)**. A VIF above 10 indicates a problematic degree of multicollinearity.
+
+```{r multicollinearity-pairs, fig.width = 7, fig.height = 7}
+temp_mc <- training_df %>%
+  dplyr::select(div_to_price, X10y_treasury, excess_return, market_variance)
+
+pairs(temp_mc,
+      main   = "Pairwise Scatter Plots — AIC-Selected Predictors",
+      col    = "steelblue",
+      pch    = 16,
+      cex    = 0.6)
+```
+
+```{r multicollinearity-cor}
+kable(round(cor(temp_mc), 4),
+      caption = "Pairwise Correlations — AIC-Selected Predictors") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r vif}
+vif_vals <- vif(AIC_reg)
+vif_df   <- data.frame(
+  Variable = names(vif_vals),
+  VIF      = round(vif_vals, 4)
+)
+kable(vif_df, caption = "Variance Inflation Factors — AIC-Selected Model") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+All VIF values are substantially below 10. **Multicollinearity is not a concern** in the selected model, and OLS coefficient estimates are stable.
+
+## Normality of Residuals
+
+We assess whether the model residuals are approximately normally distributed — a key OLS assumption for finite-sample inference. We use a QQ plot for visual inspection and the **Shapiro-Wilk test** for a formal hypothesis test.
+
+> **Note:** This section tests the *normality* of residuals, which is distinct from heteroskedasticity. Heteroskedasticity refers to non-constant residual variance and is assessed separately in Section 6.3 using the Breusch-Pagan test.
+
+```{r normality-qq}
+qqPlot(AIC_reg$residuals,
+       main = "QQ Plot of Residuals — AIC-Selected Model",
+       ylab = "Residual Quantiles",
+       col  = "steelblue",
+       col.lines = "firebrick")
+```
+
+```{r shapiro-wilk}
+sw_test <- shapiro.test(AIC_reg$residuals)
+cat("Shapiro-Wilk Test for Normality of Residuals:\n")
+cat("  W statistic =", round(sw_test$statistic, 4), "\n")
+cat("  p-value     =", format(sw_test$p.value, scientific = TRUE, digits = 4), "\n")
+```
+
+The QQ plot shows departures from the 45° line in both tails, and the Shapiro-Wilk test rejects the null hypothesis of normality (p < 0.05). **The residuals exhibit heavier tails than a normal distribution**, a common feature of monthly financial return series driven by occasional large price shocks. This violation motivates further investigation of heteroskedasticity and the use of robust standard errors.
+
+## Heteroskedasticity
+
+Non-normality alone does not imply heteroskedasticity. We test separately for **non-constant residual variance** using the **Breusch-Pagan test**, which regresses the squared residuals on the original predictors.
+
+- $H_0$: Residual variance is constant (homoskedastic)
+- $H_1$: Residual variance depends on the predictors (heteroskedastic)
+
+```{r residuals-vs-fitted}
+# Residuals vs. Fitted Values plot: a fan or funnel shape indicates heteroskedasticity
+plot(AIC_reg$fitted.values, AIC_reg$residuals,
+     main = "Residuals vs. Fitted Values — AIC-Selected Model",
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     pch  = 16,
+     col  = adjustcolor("steelblue", alpha.f = 0.6))
+abline(h = 0, col = "firebrick", lty = 2, lwd = 1.5)
+```
+
+```{r breusch-pagan}
+bp_test <- bptest(AIC_reg)
+cat("Breusch-Pagan Test for Heteroskedasticity:\n")
+cat("  BP statistic =", round(bp_test$statistic, 4), "\n")
+cat("  df           =", bp_test$parameter, "\n")
+cat("  p-value      =", round(bp_test$p.value, 4), "\n")
+```
+
+```{r bp-interpretation, echo = FALSE, results = 'asis'}
+if (bp_test$p.value < 0.05) {
+  cat(paste0(
+    "> **Result:** The Breusch-Pagan test yields p = ",
+    round(bp_test$p.value, 4),
+    " < 0.05. We **reject the null hypothesis** of homoskedasticity. ",
+    "Residual variance is not constant, indicating the presence of heteroskedasticity. ",
+    "We address this by computing heteroskedasticity-consistent (HC) standard errors in Section 6.4."
+  ))
+} else {
+  cat(paste0(
+    "> **Result:** The Breusch-Pagan test yields p = ",
+    round(bp_test$p.value, 4),
+    " > 0.05. We **fail to reject the null hypothesis** of homoskedasticity. ",
+    "There is no strong statistical evidence of heteroskedasticity. ",
+    "We nonetheless report robust standard errors in Section 6.4 as a precaution."
+  ))
+}
+```
+
+## Robust Standard Errors
+
+To account for potential heteroskedasticity, we re-estimate the AIC model using **Heteroskedasticity-Consistent (HC) standard errors** — also known as Huber-White sandwich estimators. Robust standard errors correct the inference (standard errors, t-statistics, and p-values) without altering the point estimates.
+
+```{r robust-regression}
+robust_AIC <- lm_robust(
+  ford_return ~ div_to_price + market_variance + X10y_treasury + excess_return,
+  data = training_df
+)
+summary(robust_AIC)
+```
+
+> **Key point:** The coefficient estimates from the robust model are identical to the OLS estimates. Only standard errors and inference statistics change. For prediction purposes, either model yields the same fitted values.
+
+## Coefficient Interpretation
+
+```{r coef-table}
+coef_df           <- as.data.frame(summary(AIC_reg)$coefficients)
+colnames(coef_df) <- c("Estimate", "Std. Error", "t-value", "p-value")
+coef_df_display   <- round(coef_df, 4)
+
+kable(coef_df_display,
+      caption = "AIC-Selected Model — Coefficient Estimates (OLS)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**Economic Interpretation of Coefficients:**
+
+- **`excess_return` (Market Beta):** Captures Ford's systematic exposure to broad market movements. A positive and highly significant coefficient confirms that Ford co-moves strongly with the S&P 500, consistent with CAPM theory. Ford's market beta exceeds 1, indicating above-average market sensitivity.
+- **`div_to_price` (Dividend Yield):** The dividend-to-price ratio serves as a valuation signal. A high dividend yield relative to price may reflect undervaluation or financial distress, both of which influence expected returns.
+- **`market_variance` (Implied Variance):** Higher market variance (derived from VIX) captures heightened uncertainty. During high-volatility regimes, investor risk aversion rises, depressing valuations and generating larger return swings for cyclical stocks such as Ford.
+- **`X10y_treasury` (10-Year Treasury Yield):** The long-term risk-free rate serves as the discount rate for future cash flows. Rising yields compress equity valuations; falling yields tend to boost them.
+
+---
+
+# Out-of-Sample Prediction and Model Evaluation
+
+We now evaluate all four models on the **holdout period (January 2024 – November 2025)** — data that were never used during estimation. This provides an unbiased measure of true forecasting performance.
+
+```{r evaluation-functions}
+# ── Forecast accuracy metrics ─────────────────────────────────────────────────
+rmse   <- function(a, p) sqrt(mean((a - p)^2, na.rm = TRUE))
+mae    <- function(a, p) mean(abs(a - p),     na.rm = TRUE)
+r2_oos <- function(a, p) {
+  1 - sum((a - p)^2, na.rm = TRUE) /
+      sum((a - mean(a, na.rm = TRUE))^2, na.rm = TRUE)
+}
+```
+
+```{r predictions}
+actual_test <- predict_df$ford_return
+
+# Generate out-of-sample point forecasts for each model
+pred_full  <- predict(big_reg, newdata = predict_df)
+pred_aic   <- predict(AIC_reg, newdata = predict_df)
+pred_cp    <- predict(CP_reg,  newdata = predict_df)
+pred_capm  <- predict(CAPM,    newdata = predict_df)
+```
+
+## Model Comparison Summary Table
+
+```{r model-comparison-table}
+model_comparison <- data.frame(
+  Model        = c("Full (11 vars)", "AIC-Selected (4 vars)",
+                   "Cp-Selected (3 vars)", "CAPM (1 var)"),
+  Train_AdjR2  = round(c(summary(big_reg)$adj.r.squared,
+                           summary(AIC_reg)$adj.r.squared,
+                           summary(CP_reg)$adj.r.squared,
+                           summary(CAPM)$adj.r.squared), 4),
+  Train_AIC    = round(c(AIC(big_reg), AIC(AIC_reg),
+                           AIC(CP_reg),  AIC(CAPM)), 2),
+  Test_RMSE    = round(c(rmse(actual_test, pred_full),
+                           rmse(actual_test, pred_aic),
+                           rmse(actual_test, pred_cp),
+                           rmse(actual_test, pred_capm)), 4),
+  Test_MAE     = round(c(mae(actual_test, pred_full),
+                           mae(actual_test, pred_aic),
+                           mae(actual_test, pred_cp),
+                           mae(actual_test, pred_capm)), 4),
+  Test_OOS_R2  = round(c(r2_oos(actual_test, pred_full),
+                           r2_oos(actual_test, pred_aic),
+                           r2_oos(actual_test, pred_cp),
+                           r2_oos(actual_test, pred_capm)), 4)
+)
+
+kable(
+  model_comparison,
+  col.names = c("Model", "Train Adj. R²", "Train AIC",
+                "Test RMSE", "Test MAE", "Test OOS R²"),
+  caption   = "Full Model Comparison: In-Sample and Out-of-Sample Performance"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  row_spec(2, bold = TRUE, background = "#d4edda")
+```
+
+*The highlighted row indicates the AIC-selected model. OOS R² measures the fraction of out-of-sample variance explained relative to a naive mean forecast; values near zero or negative indicate that the model barely outperforms (or underperforms) simply predicting the historical average return.*
+
+## Actual vs. Predicted Plot — AIC Model
+
+```{r actual-vs-predicted-plot, fig.width = 10, fig.height = 5}
+# Convert dates for x-axis
+holdout_dates <- as.Date(predict_df$Date, format = "%m/%d/%Y")
+
+plot_df <- data.frame(
+  Date      = holdout_dates,
+  Actual    = actual_test,
+  Predicted = pred_aic
+)
+
+ggplot(plot_df, aes(x = Date)) +
+  geom_line(aes(y = Actual,    color = "Actual"),                 linewidth = 0.9) +
+  geom_line(aes(y = Predicted, color = "Predicted (AIC Model)"),  linewidth = 0.9,
+            linetype = "dashed") +
+  geom_point(aes(y = Actual,    color = "Actual"),                size = 2.5) +
+  geom_point(aes(y = Predicted, color = "Predicted (AIC Model)"), size = 2.5,
+             shape = 17) +
+  scale_color_manual(
+    values = c("Actual" = "steelblue", "Predicted (AIC Model)" = "firebrick")
+  ) +
+  labs(
+    title    = "Actual vs. Predicted Ford Monthly Returns — Holdout Period",
+    subtitle = "AIC-Selected 4-Variable Model (Jan 2024 – Nov 2025)",
+    x        = "Date",
+    y        = "Monthly Return",
+    color    = ""
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+The plot illustrates the directional accuracy of the AIC model during the holdout period. While the model captures broad movements driven by market-wide factors, it understandably struggles to replicate the full magnitude of idiosyncratic Ford-specific return shocks — consistent with the inherent difficulty of individual stock return prediction.
+
+---
+
+# Final Model Recommendation
+
+Based on the combined evidence from in-sample model selection, diagnostic testing, and out-of-sample evaluation, we recommend the **AIC-Selected 4-Variable Model** as the final specification:
+
+$$\hat{R}^{Ford}_t = \hat{\beta}_0 + \hat{\beta}_1 \cdot \text{DivYield}_t + \hat{\beta}_2 \cdot \text{MktVar}_t + \hat{\beta}_3 \cdot \text{10yYield}_t + \hat{\beta}_4 \cdot \text{ExcessReturn}_t + \varepsilon_t$$
+
+**Rationale for selection:**
+
+1. **Parsimony:** The model retains only four economically motivated predictors, avoiding the overfitting risk of the full 11-variable specification.
+2. **In-sample fit:** It achieves the highest Adjusted R² among parsimonious models (4 variables or fewer), outperforming both the Cp-selected model and the CAPM benchmark.
+3. **Out-of-sample performance:** The AIC model produces competitive RMSE and MAE on the holdout period, demonstrating reasonable generalizability.
+4. **Economic coherence:** All four predictors — market beta (systematic risk), dividend yield (valuation), implied variance (uncertainty), and Treasury yield (discount rate) — have well-established theoretical links to equity returns in the asset pricing literature.
+5. **Robustness:** Inference remains qualitatively stable after applying HC robust standard errors to account for potential heteroskedasticity.
+
+---
+
+# Conclusion
+
+This project set out to determine whether Ford Motor Company's monthly stock returns can be meaningfully explained and predicted using macroeconomic and market-level variables. Our analysis yields several key findings:
+
+1. **Predictability exists, but is moderate.** The 4-variable AIC model explains approximately `r round(summary(AIC_reg)$r.squared * 100, 1)`% of in-sample variation in Ford's monthly returns (Adjusted R² ≈ `r round(summary(AIC_reg)$adj.r.squared, 4)`). While substantial for monthly individual-stock prediction, a large share of variation remains unexplained by systematic factors alone — consistent with the efficient markets hypothesis.
+
+2. **Market risk is the dominant driver.** The market excess return is the most statistically significant predictor across all models, confirming that Ford's returns are strongly tied to broad market movements. Ford's estimated market beta exceeds 1.0, reflecting its cyclical nature as an auto manufacturer.
+
+3. **Macro factors add meaningful explanatory power.** Dividend yield, market variance, and the 10-year Treasury yield each contribute incremental information beyond the single-factor CAPM, as evidenced by the substantial improvement in Adjusted R² relative to the CAPM benchmark.
+
+4. **Out-of-sample performance is modest.** As is typical for individual equity return prediction, out-of-sample R² is considerably lower than its in-sample counterpart, reflecting the combined effects of model uncertainty, time-varying parameters, and genuine randomness in short-horizon returns. The model nonetheless provides a useful directional signal relative to a naive mean forecast.
+
+5. **The residuals deviate from normality but heteroskedasticity is formally tested.** The Shapiro-Wilk test indicates non-normal residuals (fat tails), and the Breusch-Pagan test formally assesses heteroskedasticity. Robust standard errors are applied to ensure reliable inference regardless of the outcome.
+
+6. **Variable selection matters.** The stepwise AIC and Mallows' Cp procedures converge on overlapping but distinct predictor sets, and their outputs are not interchangeable. Resolving the disagreement using Adjusted R² as a tiebreaker is a principled approach that avoids ad hoc model choice.
+
+Overall, the AIC-selected multi-factor regression model represents the best-performing, most statistically sound specification for explaining Ford's return dynamics within this dataset. Future work could explore time-varying parameter models, rolling-window estimation, or machine learning approaches to further improve out-of-sample accuracy.
+
+---
+
+# Appendix: Additional Diagnostics
+
+## Regression Diagnostic Plots — AIC Model {-}
+
+```{r appendix-diagnostic-plots, fig.width = 10, fig.height = 8}
+# Base R's built-in diagnostic suite: Residuals vs Fitted, Normal QQ,
+# Scale-Location (sqrt standardized residuals), Residuals vs Leverage
+par(mfrow = c(2, 2))
+plot(AIC_reg,
+     which = 1:4,
+     col   = adjustcolor("steelblue", alpha.f = 0.6),
+     pch   = 16)
+par(mfrow = c(1, 1))
+```
+
+## Holdout Period Predictions — All Models {-}
+
+```{r appendix-all-predictions}
+# Full prediction table for the out-of-sample period
+all_preds <- data.frame(
+  Date      = predict_df$Date,
+  Actual    = round(actual_test, 4),
+  Full      = round(pred_full,   4),
+  AIC_Model = round(pred_aic,    4),
+  CP_Model  = round(pred_cp,     4),
+  CAPM      = round(pred_capm,   4)
+)
+
+kable(
+  all_preds,
+  col.names = c("Date", "Actual", "Full Model",
+                "AIC Model", "Cp Model", "CAPM"),
+  caption   = "Out-of-Sample Monthly Predictions by Model — Jan 2024 to Nov 2025"
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE,
+                font_size = 12)
+```
+
+## Full Model Coefficient Estimates {-}
+
+```{r appendix-full-model-coefs}
+full_coef_df           <- as.data.frame(summary(big_reg)$coefficients)
+colnames(full_coef_df) <- c("Estimate", "Std. Error", "t-value", "p-value")
+
+kable(round(full_coef_df, 4),
+      caption = "Full Model (11 Variables) — Coefficient Estimates") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
